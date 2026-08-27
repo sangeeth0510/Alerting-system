@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
+import type { Session } from '@supabase/supabase-js'
+import { supabase } from './supabaseClient'
 import './App.css'
 
 /* ---------------------------------------------------------------
-   AlertManager — frontend simulation
-   Flow: log in -> pick an asset (Gold/Silver) + a target price ->
-   a mock live feed ticks every 2s -> crossing the target fires an
-   in-app "alert sent" toast. No backend yet — everything (session,
-   prices, alerts) lives in component state / localStorage.
+   AlertManager — now backed by Supabase
+   Flow: real email/password auth via Supabase Auth -> alerts read
+   from and written to a Postgres 'alerts' table (RLS-scoped to the
+   logged-in user) -> a mock live feed still ticks every 2s locally
+   and flips an alert's status to 'triggered' in the DB when hit.
 ----------------------------------------------------------------*/
 
 type Asset = 'gold' | 'silver'
@@ -19,7 +21,7 @@ interface PriceAlert {
   condition: Condition
   target: number
   status: AlertStatus
-  createdAt: number
+  created_at: string
 }
 
 interface Toast {
@@ -33,8 +35,6 @@ const ASSET_META: Record<Asset, { label: string; unit: string; base: number; vol
   silver: { label: 'Silver', unit: '$/oz', base: 29.4, volatility: 0.18 },
 }
 
-const SESSION_KEY = 'am_session_email'
-
 function randomWalk(current: number, volatility: number) {
   const delta = (Math.random() - 0.5) * 2 * volatility
   return Math.round((current + delta) * 100) / 100
@@ -45,10 +45,14 @@ function formatPrice(asset: Asset, value: number) {
 }
 
 function App() {
-  const [email, setEmail] = useState<string | null>(null)
+  const [session, setSession] = useState<Session | null>(null)
+  const [authLoading, setAuthLoading] = useState(true)
+
   const [loginEmail, setLoginEmail] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
   const [loginError, setLoginError] = useState('')
+  const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin')
+  const [authBusy, setAuthBusy] = useState(false)
 
   const [prices, setPrices] = useState<Record<Asset, number>>({
     gold: ASSET_META.gold.base,
@@ -66,15 +70,72 @@ function App() {
   const alertsRef = useRef<PriceAlert[]>(alerts)
   alertsRef.current = alerts
 
-  // restore a fake session
+  const email = session?.user?.email ?? null
+  const userId = session?.user?.id ?? null
+
+  // pick up the current session on load, and keep it in sync
   useEffect(() => {
-    const saved = localStorage.getItem(SESSION_KEY)
-    if (saved) setEmail(saved)
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session)
+      setAuthLoading(false)
+    })
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession)
+    })
+    return () => listener.subscription.unsubscribe()
   }, [])
+
+  // load this user's alerts whenever they log in, and keep them live
+  useEffect(() => {
+    if (!userId) {
+      setAlerts([])
+      return
+    }
+
+    let cancelled = false
+    supabase
+      .from('alerts')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .then(({ data, error }) => {
+        if (!cancelled && !error && data) setAlerts(data as PriceAlert[])
+      })
+
+    // keep the list in sync if the row changes from another tab/device
+    const channel = supabase
+      .channel('alerts-changes')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'alerts', filter: `user_id=eq.${userId}` },
+        (payload) => {
+          setAlerts((current) => {
+            if (payload.eventType === 'INSERT') {
+              const row = payload.new as PriceAlert
+              return current.some((a) => a.id === row.id) ? current : [row, ...current]
+            }
+            if (payload.eventType === 'UPDATE') {
+              const row = payload.new as PriceAlert
+              return current.map((a) => (a.id === row.id ? row : a))
+            }
+            if (payload.eventType === 'DELETE') {
+              const row = payload.old as PriceAlert
+              return current.filter((a) => a.id !== row.id)
+            }
+            return current
+          })
+        }
+      )
+      .subscribe()
+
+    return () => {
+      cancelled = true
+      supabase.removeChannel(channel)
+    }
+  }, [userId])
 
   // mock live price feed
   useEffect(() => {
-    if (!email) return
+    if (!userId) return
     const interval = setInterval(() => {
       setPrices((prev) => {
         const next: Record<Asset, number> = {
@@ -83,7 +144,6 @@ function App() {
         }
         setPrevPrices(prev)
 
-        // evaluate watching alerts against the new tick
         const stillWatching = alertsRef.current.filter((a) => a.status === 'watching')
         if (stillWatching.length) {
           const toTrigger: PriceAlert[] = []
@@ -95,23 +155,42 @@ function App() {
             if (hit) toTrigger.push(a)
           }
           if (toTrigger.length) {
-            setAlerts((current) =>
-              current.map((a) =>
-                toTrigger.some((t) => t.id === a.id) ? { ...a, status: 'triggered' } : a
+            toTrigger.forEach(async (a) => {
+              // Atomic one-time transition. The database webhook should send
+              // the email only when status changes from watching -> triggered.
+              const { data, error } = await supabase
+                .from('alerts')
+                .update({ status: 'triggered' })
+                .eq('id', a.id)
+                .eq('status', 'watching')
+                .select('id')
+                .maybeSingle()
+
+              // No row means this alert was already triggered by another tick/tab.
+              if (error) {
+                console.error('Failed to trigger alert:', error)
+                return
+              }
+              if (!data) return
+
+              // Update this tab immediately; Realtime will keep other tabs/devices synced.
+              setAlerts((current) =>
+                current.map((item) =>
+                  item.id === a.id ? { ...item, status: 'triggered' as AlertStatus } : item
+                )
               )
-            )
-            const newToasts: Toast[] = toTrigger.map((a) => ({
-              id: `${a.id}-${Date.now()}`,
-              tone: 'trigger',
-              message: `${ASSET_META[a.asset].label} ${a.condition === 'above' ? 'rose above' : 'fell below'} ${formatPrice(
-                a.asset,
-                a.target
-              )} — alert sent to ${email}`,
-            }))
-            setToasts((current) => [...current, ...newToasts])
-            newToasts.forEach((t) => {
+
+              const toast: Toast = {
+                id: `${a.id}-${Date.now()}`,
+                tone: 'trigger',
+                message: `${ASSET_META[a.asset].label} ${
+                  a.condition === 'above' ? 'rose above' : 'fell below'
+                } ${formatPrice(a.asset, a.target)} — alert triggered`,
+              }
+
+              setToasts((current) => [...current, toast])
               setTimeout(() => {
-                setToasts((current) => current.filter((x) => x.id !== t.id))
+                setToasts((current) => current.filter((x) => x.id !== toast.id))
               }, 5000)
             })
           }
@@ -121,51 +200,66 @@ function App() {
       })
     }, 2000)
     return () => clearInterval(interval)
-  }, [email])
+  }, [userId])
 
-  function handleLogin(e: React.FormEvent) {
+  async function handleAuth(e: React.FormEvent) {
     e.preventDefault()
     if (!loginEmail.trim() || !loginPassword.trim()) {
       setLoginError('Enter both an email and a password to continue.')
       return
     }
-    localStorage.setItem(SESSION_KEY, loginEmail.trim())
-    setEmail(loginEmail.trim())
+    setAuthBusy(true)
     setLoginError('')
+
+    const { error } =
+      authMode === 'signup'
+        ? await supabase.auth.signUp({ email: loginEmail.trim(), password: loginPassword })
+        : await supabase.auth.signInWithPassword({ email: loginEmail.trim(), password: loginPassword })
+
+    setAuthBusy(false)
+    if (error) setLoginError(error.message)
   }
 
-  function handleLogout() {
-    localStorage.removeItem(SESSION_KEY)
-    setEmail(null)
+  async function handleLogout() {
+    await supabase.auth.signOut()
     setAlerts([])
     setToasts([])
   }
 
-  function handleAddAlert(e: React.FormEvent) {
+  async function handleAddAlert(e: React.FormEvent) {
     e.preventDefault()
     const target = parseFloat(formTarget)
     if (!formTarget || Number.isNaN(target) || target <= 0) {
       setFormError('Enter a target price greater than 0.')
       return
     }
-    const alert: PriceAlert = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    if (!userId) return
+
+    const { error } = await supabase.from('alerts').insert({
+      user_id: userId,
       asset: formAsset,
       condition: formCondition,
       target,
       status: 'watching',
-      createdAt: Date.now(),
+    })
+
+    if (error) {
+      setFormError(error.message)
+      return
     }
-    setAlerts((current) => [alert, ...current])
     setFormTarget('')
     setFormError('')
   }
 
-  function removeAlert(id: string) {
-    setAlerts((current) => current.filter((a) => a.id !== id))
+  async function removeAlert(id: string) {
+    await supabase.from('alerts').delete().eq('id', id)
   }
 
-  if (!email) {
+  if (authLoading) {
+    return <div className="am-root" />
+  }
+
+  if (!session) {
     return (
       <div className="am-root">
         <div className="am-login-wrap">
@@ -175,12 +269,12 @@ function App() {
               <span className="am-nav-name am-display">AlertManager</span>
             </div>
             <h1 className="am-h2 am-display" style={{ marginTop: 24 }}>
-              Sign in to manage your alerts
+              {authMode === 'signup' ? 'Create your account' : 'Sign in to manage your alerts'}
             </h1>
             <p className="am-h2-sub" style={{ marginBottom: 28 }}>
               Watch gold and silver, and get notified the moment your price is hit.
             </p>
-            <form onSubmit={handleLogin} className="am-form">
+            <form onSubmit={handleAuth} className="am-form">
               <label className="am-field">
                 <span>Email</span>
                 <input
@@ -202,12 +296,22 @@ function App() {
                 />
               </label>
               {loginError && <p className="am-form-error">{loginError}</p>}
-              <button className="am-btn am-btn-primary am-btn-block" type="submit">
-                Sign in
+              <button className="am-btn am-btn-primary am-btn-block" type="submit" disabled={authBusy}>
+                {authBusy ? 'Please wait…' : authMode === 'signup' ? 'Sign up' : 'Sign in'}
               </button>
             </form>
             <p className="am-login-note">
-              This is a frontend simulation — any email and password will work for now.
+              {authMode === 'signup' ? 'Already have an account? ' : "Don't have an account? "}
+              <button
+                type="button"
+                className="am-btn am-btn-ghost am-btn-small"
+                onClick={() => {
+                  setAuthMode(authMode === 'signup' ? 'signin' : 'signup')
+                  setLoginError('')
+                }}
+              >
+                {authMode === 'signup' ? 'Sign in' : 'Sign up'}
+              </button>
             </p>
           </div>
         </div>
@@ -351,5 +455,3 @@ function App() {
 }
 
 export default App
-
-//changes
